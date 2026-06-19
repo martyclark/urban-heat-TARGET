@@ -30,23 +30,41 @@ RUN pip install --no-cache-dir \
     "pyproj==3.7.1" \
     "rasterio==1.4.4" \
     "geopandas==1.1.3" \
-    "rioxarray==0.19.0"
+    "rioxarray==0.19.0" \
+    "rasterstats>=0.19" \
+    "duckdb>=0.10"
 
 # Climate indices — pin minor version, breaking changes between releases
 RUN pip install --no-cache-dir \
     "xclim>=0.52,<0.53"
 
-# Web / visualisation (not needed for TARGET runs but included for the full app)
+# Web / visualisation
 RUN pip install --no-cache-dir \
     "streamlit>=1.35" \
     "plotly>=5.22" \
-    "pydeck>=0.9"
+    "pydeck>=0.9" \
+    "folium>=0.17" \
+    "streamlit-folium>=0.22" \
+    "branca>=0.7"
+
+# GCS access
+RUN pip install --no-cache-dir \
+    "gcsfs>=2024.2"
 
 # hit package
 COPY hit/ /app/hit/
 COPY pyproject.toml /app/
 RUN pip install --no-cache-dir -e ".[dev]"
 
+COPY app.py /app/
 COPY tests/ /app/tests/
 
-CMD ["python", "-m", "pytest", "tests/", "-v"]
+# Mount point for GCS bucket (populated at runtime via gcsfuse volume mount)
+RUN mkdir -p /app/data
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "app.py", \
+     "--server.address=0.0.0.0", \
+     "--server.port=8501", \
+     "--server.headless=true"]
