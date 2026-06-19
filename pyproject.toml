@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hit"
+version = "0.1.0"
+description = "Urban Heat Index Tool — city-level screening and neighbourhood TARGET modelling"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "xarray",
+    "zarr",
+    "fsspec",
+    "gcsfs",
+    "aiohttp",
+    "geopandas",
+    "shapely",
+    "fiona",
+    "rasterio",
+    "rioxarray",
+    "rasterstats",
+    "duckdb",
+    "requests",
+    "xclim>=0.52",
+    "matplotlib",
+    "plotly",
+    "pydeck",
+    "streamlit",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hit*"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
