@@ -482,8 +482,19 @@ with tab1:
         window_days = period_weeks * 7
 
         # ── Single UTCI fetch covering full range ─────────────────────────────
-        with st.spinner(f"Loading UTCI {FULL_START}–{FULL_END}…"):
-            utci_full = _fetch_utci_daily_cached(lat, lon, FULL_START, FULL_END, slug)
+        try:
+            with st.spinner(f"Loading UTCI {FULL_START}–{FULL_END}…"):
+                utci_full = _fetch_utci_daily_cached(lat, lon, FULL_START, FULL_END, slug)
+        except EnvironmentError:
+            st.warning(
+                "**CDS API key required for UTCI climate data.**\n\n"
+                "Register at [cds.climate.copernicus.eu](https://cds.climate.copernicus.eu) "
+                "and accept the [dataset licence](https://cds.climate.copernicus.eu/datasets/derived-utci-historical), "
+                "then add your key to `.streamlit/secrets.toml`:\n\n"
+                "```toml\nCDS_API_KEY = \"your-key-here\"\n```\n\n"
+                "Or set it as an environment variable: `export CDS_API_KEY=your-key-here`"
+            )
+            st.stop()
 
         utci_base = utci_full.sel(time=slice(f"{BASELINE_START}-01-01", f"{BASELINE_END}-12-31"))
         utci_rec  = utci_full.sel(time=slice(f"{BASELINE_END + 1}-01-01", f"{FULL_END}-12-31"))
