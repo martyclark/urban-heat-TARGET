@@ -119,7 +119,22 @@ def _fmt_pop(n: int | None) -> str:
     return str(n)
 
 
+_MAPLIBRE_STYLE = {
+    "version": 8,
+    "sources": {
+        "osm": {
+            "type": "raster",
+            "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+            "tileSize": 256,
+            "attribution": "© OpenStreetMap contributors",
+        }
+    },
+    "layers": [{"id": "osm", "type": "raster", "source": "osm"}],
+}
+
+
 def _city_boundary_html(geojson_str: str, lon_min: float, lat_min: float, lon_max: float, lat_max: float) -> str:
+    style = json.dumps(_MAPLIBRE_STYLE)
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet">
@@ -130,7 +145,7 @@ def _city_boundary_html(geojson_str: str, lon_min: float, lat_min: float, lon_ma
 <script>
 const map = new maplibregl.Map({{
   container: 'map',
-  style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+  style: {style},
   bounds: [{lon_min},{lat_min},{lon_max},{lat_max}],
   fitBoundsOptions: {{padding: 40}},
 }});
@@ -146,19 +161,12 @@ map.on('load', () => {{
 
 
 def _results_map_html(lat: float, lon: float, meta: dict, label: str, opacity: float) -> str:
-    import time as _t
     bounds = meta["bounds"]  # [W, S, E, N]
     vmin, vmax = meta["vmin"], meta["vmax"]
-    cache_bust = int(_t.time())
+    cache_bust = int(time.time())
     tile_url = f"http://localhost:8502/tiles/{{z}}/{{x}}/{{y}}.png?opacity={opacity}&v={cache_bust}"
-    stops = [
-        {"offset": "0%",   "color": "#ffffb2"},
-        {"offset": "25%",  "color": "#fecc5c"},
-        {"offset": "50%",  "color": "#fd8d3c"},
-        {"offset": "75%",  "color": "#f03b20"},
-        {"offset": "100%", "color": "#bd0026"},
-    ]
-    legend_css = "".join(f"{s['color']} {s['offset']}," for s in stops).rstrip(",")
+    legend_css = "#ffffb2 0%,#fecc5c 25%,#fd8d3c 50%,#f03b20 75%,#bd0026 100%"
+    style = json.dumps(_MAPLIBRE_STYLE)
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet">
@@ -180,7 +188,7 @@ html,body,#map{{height:100%;margin:0;padding:0;}}
 <script>
 const map = new maplibregl.Map({{
   container: 'map',
-  style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+  style: {style},
   bounds: [{bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}],
   fitBoundsOptions: {{padding: 20}},
 }});
@@ -400,12 +408,11 @@ with tab1:
         # ── City map ─────────────────────────────────────────────────────────
         geom = city.get("geometry")
         if geom is not None:
-            try:
-                lon_min, lat_min, lon_max, lat_max = geom.bounds
-                geojson_str = json.dumps(geom.__geo_interface__)
-                st.components.v1.html(_city_boundary_html(geojson_str, lon_min, lat_min, lon_max, lat_max), height=340)
-            except Exception:
-                pass
+            lon_min, lat_min, lon_max, lat_max = geom.bounds
+            geojson_str = json.dumps(geom.__geo_interface__)
+            st.components.v1.html(_city_boundary_html(geojson_str, lon_min, lat_min, lon_max, lat_max), height=340)
+        else:
+            st.info("No boundary geometry available for this city.")
 
         # Population trend (2000–2025)
         pop_years = [yr for yr in [2000, 2005, 2010, 2015, 2020, 2025] if city.get(f"pop_{yr}")]
