@@ -26,8 +26,11 @@ dependencies = [
     "xclim>=0.52",
     "matplotlib",
     "plotly",
-    "pydeck",
     "streamlit",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "mercantile>=1.2",
+    "Pillow>=10",
 ]
 
 [tool.setuptools.packages.find]

@@ -10,13 +10,12 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-import folium
+import json
+import time as _time
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 import xarray as xr
-from branca.colormap import LinearColormap
-from streamlit_folium import st_folium
 
 from hit.cities.loader import UCDB_DIR, load_ucdb
 from hit.cities.search import search_cities
@@ -120,6 +119,81 @@ def _fmt_pop(n: int | None) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.0f}k"
     return str(n)
+
+
+def _city_boundary_html(geojson_str: str, lon_min: float, lat_min: float, lon_max: float, lat_max: float) -> str:
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+<style>html,body,#map{{height:100%;margin:0;padding:0;}}</style>
+</head><body>
+<div id="map"></div>
+<script>
+const map = new maplibregl.Map({{
+  container: 'map',
+  style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+  bounds: [{lon_min},{lat_min},{lon_max},{lat_max}],
+  fitBoundsOptions: {{padding: 40}},
+}});
+map.on('load', () => {{
+  map.addSource('city', {{type:'geojson', data:{geojson_str}}});
+  map.addLayer({{id:'city-fill', type:'fill', source:'city',
+    paint:{{'fill-color':'#1f77b4','fill-opacity':0.2}}}});
+  map.addLayer({{id:'city-line', type:'line', source:'city',
+    paint:{{'line-color':'#1f77b4','line-width':2}}}});
+}});
+</script>
+</body></html>"""
+
+
+def _results_map_html(lat: float, lon: float, meta: dict, label: str, opacity: float) -> str:
+    import time as _t
+    bounds = meta["bounds"]  # [W, S, E, N]
+    vmin, vmax = meta["vmin"], meta["vmax"]
+    cache_bust = int(_t.time())
+    tile_url = f"http://localhost:8502/tiles/{{z}}/{{x}}/{{y}}.png?opacity={opacity}&v={cache_bust}"
+    stops = [
+        {"offset": "0%",   "color": "#ffffb2"},
+        {"offset": "25%",  "color": "#fecc5c"},
+        {"offset": "50%",  "color": "#fd8d3c"},
+        {"offset": "75%",  "color": "#f03b20"},
+        {"offset": "100%", "color": "#bd0026"},
+    ]
+    legend_css = "".join(f"{s['color']} {s['offset']}," for s in stops).rstrip(",")
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+<style>
+html,body,#map{{height:100%;margin:0;padding:0;}}
+#legend{{position:absolute;bottom:24px;left:10px;background:rgba(255,255,255,0.9);
+  padding:8px 10px;border-radius:4px;font:12px/1.4 sans-serif;min-width:140px;}}
+#legend .bar{{height:10px;background:linear-gradient(to right,{legend_css});border-radius:2px;margin:4px 0;}}
+#legend .ends{{display:flex;justify-content:space-between;}}
+</style>
+</head><body>
+<div id="map"></div>
+<div id="legend">
+  <b>{label}</b>
+  <div class="bar"></div>
+  <div class="ends"><span>{vmin:.1f}</span><span>{vmax:.1f}</span></div>
+</div>
+<script>
+const map = new maplibregl.Map({{
+  container: 'map',
+  style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+  bounds: [{bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}],
+  fitBoundsOptions: {{padding: 20}},
+}});
+map.on('load', () => {{
+  map.addSource('heat', {{type:'raster', tiles:['{tile_url}'], tileSize:256, attribution:'TARGET model'}});
+  map.addLayer({{id:'heat-layer', type:'raster', source:'heat',
+    paint:{{'raster-opacity':{opacity}}}}});
+  map.addControl(new maplibregl.NavigationControl(), 'top-right');
+}});
+</script>
+</body></html>"""
 
 
 def _zip_files(named_paths: dict[str, Path]) -> bytes:
@@ -338,18 +412,8 @@ with tab1:
         if geom is not None:
             try:
                 lon_min, lat_min, lon_max, lat_max = geom.bounds
-                m_city = folium.Map(tiles="CartoDB positron")
-                folium.GeoJson(
-                    geom.__geo_interface__,
-                    style_function=lambda _: {
-                        "fillColor": "#1f77b4",
-                        "fillOpacity": 0.2,
-                        "color": "#1f77b4",
-                        "weight": 2,
-                    },
-                ).add_to(m_city)
-                m_city.fit_bounds([[lat_min, lon_min], [lat_max, lon_max]])
-                st_folium(m_city, width="100%", height=320, returned_objects=[], key="city_map")
+                geojson_str = json.dumps(geom.__geo_interface__)
+                st.components.v1.html(_city_boundary_html(geojson_str, lon_min, lat_min, lon_max, lat_max), height=340)
             except Exception:
                 pass
 
@@ -976,44 +1040,19 @@ with tab2:
                 )
 
                 with st.spinner("Building map…"):
+                    from hit.spatial.rasterise import gdf_to_geotiff
                     gdf = results_to_geodataframe(ds, grid_path)
-                    valid = gdf[map_col].dropna()
-                    vmin  = float(valid.quantile(0.02))
-                    vmax  = float(valid.quantile(0.98))
+                    tif_path = Path(f"data/tile_cache/{_city_slug(t2_city)}_{map_col}.tif")
+                    meta = gdf_to_geotiff(gdf, map_col, tif_path)
+                    STATE_FILE = Path("data/tile_server_state.json")
+                    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    STATE_FILE.write_text(json.dumps(meta))
 
-                    colormap = LinearColormap(
-                        colors=["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"],
-                        vmin=vmin,
-                        vmax=vmax,
-                        caption=map_choice,
-                    )
-                    gdf["_color"] = gdf[map_col].apply(
-                        lambda v: colormap(v) if v == v else "#aaaaaa"
-                    )
-
-                    _fill_opacity = heat_opacity if show_heat_layer else 0.0
-                    m = folium.Map(
-                        location=[t2_lat, t2_lon],
-                        zoom_start=13,
-                        tiles="CartoDB positron",
-                    )
-                    folium.GeoJson(
-                        gdf,
-                        style_function=lambda f, _op=_fill_opacity: {
-                            "fillColor": f["properties"].get("_color", "#aaaaaa"),
-                            "color":       "none",
-                            "weight":      0,
-                            "fillOpacity": _op,
-                        },
-                        tooltip=folium.GeoJsonTooltip(
-                            fields=[map_col],
-                            aliases=[f"{map_choice}:"],
-                            localize=True,
-                        ),
-                    ).add_to(m)
-                    colormap.add_to(m)
-
-                st_folium(m, width="100%", height=520, returned_objects=[])
+                _tile_opacity = heat_opacity if show_heat_layer else 0.0
+                st.components.v1.html(
+                    _results_map_html(t2_lat, t2_lon, meta, map_choice, _tile_opacity),
+                    height=540,
+                )
                 with st.expander("About this map"):
                     st.markdown(
                         """
