@@ -360,17 +360,9 @@ tab1, tab2, tab3 = st.tabs(["City Screening", "Neighbourhood Analysis", "Future 
 with tab1:
     st.header("City Screening")
 
-    if not any(UCDB_DIR.glob("*.gpkg")):
-        st.error(
-            "**GHSL-UCDB data not found.**  \n"
-            "Download `GHS_UCDB_GLOBE_R2024A_V1_1.zip` from  \n"
-            "https://jeodpp.jrc.ec.europa.eu/ftp/jrc-opendata/GHSL/GHS_UCDB_GLOBE_R2024A/GHS_UCDB_GLOBE_R2024A/V1-1/GHS_UCDB_GLOBE_R2024A_V1_1.zip  \n"
-            f"and extract the `.gpkg` file into `{UCDB_DIR}/`."
-        )
-        st.stop()
-
     try:
-        db = _load_ucdb()
+        with st.spinner("Loading city database (downloading on first run, ~400 MB)…"):
+            db = _load_ucdb()
     except Exception as exc:
         st.error(f"Failed to load city database: {exc}")
         st.stop()
