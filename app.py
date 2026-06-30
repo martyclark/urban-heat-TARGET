@@ -409,7 +409,7 @@ with tab1:
         geom = city.get("geometry")
         if geom is not None:
             lon_min, lat_min, lon_max, lat_max = geom.bounds
-            geojson_str = json.dumps(geom.__geo_interface__)
+            geojson_str = json.dumps({"type": "Feature", "geometry": geom.__geo_interface__, "properties": {}})
             st.components.v1.html(_city_boundary_html(geojson_str, lon_min, lat_min, lon_max, lat_max), height=340)
         else:
             st.info("No boundary geometry available for this city.")
