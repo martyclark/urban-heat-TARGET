@@ -122,40 +122,38 @@ def _fmt_pop(n: int | None) -> str:
 _MAPLIBRE_STYLE = {
     "version": 8,
     "sources": {
-        "osm": {
+        "osm-bright": {
             "type": "raster",
-            "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+            "tiles": ["https://tiles.stadiamaps.com/tiles/osm_bright/{z}/{x}/{y}.png"],
             "tileSize": 256,
-            "attribution": "© OpenStreetMap contributors",
+            "attribution": "© Stadia Maps © OpenStreetMap contributors",
         }
     },
-    "layers": [{"id": "osm", "type": "raster", "source": "osm"}],
+    "layers": [{"id": "osm-bright", "type": "raster", "source": "osm-bright"}],
 }
 
 
 def _city_boundary_html(geojson_str: str, lon_min: float, lat_min: float, lon_max: float, lat_max: float) -> str:
-    style = json.dumps(_MAPLIBRE_STYLE)
+    lat_c = (lat_min + lat_max) / 2
+    lon_c = (lon_min + lon_max) / 2
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
-<link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet">
-<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9/dist/leaflet.js"></script>
 <style>html,body,#map{{height:100%;margin:0;padding:0;}}</style>
 </head><body>
 <div id="map"></div>
 <script>
-const map = new maplibregl.Map({{
-  container: 'map',
-  style: {style},
-  bounds: [{lon_min},{lat_min},{lon_max},{lat_max}],
-  fitBoundsOptions: {{padding: 40}},
-}});
-map.on('load', () => {{
-  map.addSource('city', {{type:'geojson', data:{geojson_str}}});
-  map.addLayer({{id:'city-fill', type:'fill', source:'city',
-    paint:{{'fill-color':'#1f77b4','fill-opacity':0.2}}}});
-  map.addLayer({{id:'city-line', type:'line', source:'city',
-    paint:{{'line-color':'#1f77b4','line-width':2}}}});
-}});
+const map = L.map('map', {{zoomControl:true}});
+L.tileLayer('https://tiles.stadiamaps.com/tiles/osm_bright/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+  attribution: '&copy; <a href="https://stadiamaps.com/">Stadia Maps</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+  maxZoom: 20,
+}}).addTo(map);
+const geojson = {geojson_str};
+const layer = L.geoJSON(geojson, {{
+  style: {{color:'#1f77b4', weight:2, fillColor:'#1f77b4', fillOpacity:0.2}},
+}}).addTo(map);
+map.fitBounds(layer.getBounds(), {{padding:[20,20]}});
 </script>
 </body></html>"""
 
