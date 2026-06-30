@@ -5,6 +5,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import streamlit as st
 import xarray as xr
 
 
@@ -27,6 +28,7 @@ def peak_conditions(ds: xr.Dataset) -> pd.DataFrame:
     )
 
 
+@st.cache_data(show_spinner=False)
 def results_to_geodataframe(ds: xr.Dataset, grid_path: Path) -> gpd.GeoDataFrame:
     """Join per-cell peak stats from a TARGET Dataset to grid polygon geometry.
 

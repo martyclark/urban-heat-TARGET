@@ -200,12 +200,14 @@ map.on('load', () => {{
 </body></html>"""
 
 
-def _zip_files(named_paths: dict[str, Path]) -> bytes:
+@st.cache_data(show_spinner=False)
+def _zip_files(named_paths: tuple[tuple[str, str], ...]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for arcname, path in named_paths.items():
-            if path.exists():
-                zf.write(path, arcname)
+        for arcname, path_str in named_paths:
+            p = Path(path_str)
+            if p.exists():
+                zf.write(p, arcname)
     return buf.getvalue()
 
 
@@ -875,12 +877,12 @@ with tab2:
                 st.caption("Grid, land cover, buildings and road data for this city.")
                 st.download_button(
                     "Download morphology inputs (.zip)",
-                    data=_zip_files({
-                        "grid.gpkg":            morph_dir / "grid.gpkg",
-                        "target_landcover.csv": morph_dir / "target_landcover.csv",
-                        "gba_buildings.gpkg":   morph_dir / "gba_buildings.gpkg",
-                        "roads_raw.gpkg":       morph_dir / "roads_raw.gpkg",
-                    }),
+                    data=_zip_files((
+                        ("grid.gpkg",            str(morph_dir / "grid.gpkg")),
+                        ("target_landcover.csv", str(morph_dir / "target_landcover.csv")),
+                        ("gba_buildings.gpkg",   str(morph_dir / "gba_buildings.gpkg")),
+                        ("roads_raw.gpkg",       str(morph_dir / "roads_raw.gpkg")),
+                    )),
                     file_name=f"{city_id}_morphology.zip",
                     mime="application/zip",
                     key="dl_morph",
