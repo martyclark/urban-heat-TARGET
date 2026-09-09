@@ -30,9 +30,11 @@ from hit.era5.indices import (
     utci_category_days_annual,
 )
 from hit.era5.periods import suggest_periods
+from hit.era5.t2m import fetch_t2m_monthly
 from hit.exposure import population_weighted_heat_exposure
 from hit.jobs.queue import JOBS_DIR, get_status, list_jobs, submit_prepare, submit_run
 from hit.spatial import diurnal_stats, results_to_geodataframe, uhi_series, utci_diurnal_stats
+from hit.target.parallel import PARALLEL_CELL_THRESHOLD
 
 FULL_START     = 1991
 FULL_END       = 2025
@@ -96,6 +98,12 @@ def _fetch_utci_daily_cached(lat: float, lon: float, year_start: int, year_end: 
     return fetch_utci_daily(lat, lon, year_start, year_end, cache_path=cache_path, store=_get_utci_store())
 
 
+@st.cache_data(show_spinner=False)
+def _fetch_t2m_monthly_cached(lat: float, lon: float, year_start: int, year_end: int, slug: str):
+    cache_path = ERA5_CACHE_DIR / slug / f"t2m_monthly_{year_start}_{year_end}.nc"
+    return fetch_t2m_monthly(lat, lon, year_start, year_end, cache_path=cache_path)
+
+
 @st.cache_data(show_spinner="Loading TARGET results…")
 def _load_results_cached(nc_path: str) -> xr.Dataset:
     return xr.open_dataset(nc_path).load()
@@ -155,17 +163,25 @@ def _estimate_grid_cells(city: dict) -> int:
 
 def _grid_size_warning(n_cells: int) -> tuple[str, str] | None:
     """Return (prep_estimate, run_estimate) warning strings, or None if city is small."""
+    import multiprocessing
+    n_cores = min(multiprocessing.cpu_count() // 2, 4)
+    # ~480 cells/min per core (Salvador benchmark: 13,981 cells in 29 min)
+    _cells_per_core = n_cells / n_cores
+    _est_min = max(2, round(_cells_per_core / 480 * 0.8))   # optimistic
+    _est_max = max(5, round(_cells_per_core / 480 * 1.3))   # with overhead
     if n_cells > 40_000:
         return (
             f"~{n_cells:,} estimated cells — **very large city**. "
             "Morphology preparation will take **20–40 min** (spatial overlay across a large grid). ",
-            f"~{n_cells:,} cells — TARGET run will take **90–150 min** (runtime scales with cell count).",
+            f"~{n_cells:,} cells — TARGET will run across {n_cores} cores in parallel "
+            f"(**~{_est_min}–{_est_max} min** estimated).",
         )
-    if n_cells > 15_000:
+    if n_cells > PARALLEL_CELL_THRESHOLD:
         return (
             f"~{n_cells:,} estimated cells — **large city**. "
             "Morphology preparation will take **10–20 min**.",
-            f"~{n_cells:,} cells — TARGET run will take **45–90 min** (runtime scales with cell count).",
+            f"~{n_cells:,} cells — TARGET will run across {n_cores} cores in parallel "
+            f"(**~{_est_min}–{_est_max} min** estimated).",
         )
     return None
 
@@ -333,7 +349,7 @@ with tab1:
     city: dict | None = None
 
     if country_choice != country_sentinel:
-        city_results = search_cities("", country=country_choice, n=1000, db=db)
+        city_results = sorted(search_cities("", country=country_choice, n=1000, db=db), key=lambda r: r["name"])
         city_labels  = [f"{r['name']}  ({_fmt_pop(r['population'])})" for r in city_results]
         city_sentinel = "— select a city —"
         city_choice  = st.selectbox(
@@ -375,6 +391,119 @@ with tab1:
                 st_folium(m_city, width="100%", height=320, returned_objects=[], key="city_map")
             except Exception:
                 pass
+
+        # ── T2m sense check (monthly Tmin/Tavg/Tmax, ERA5) ─────────────────────
+        try:
+            with st.spinner(f"Loading T2m {FULL_START}–{FULL_END}…"):
+                t2m_monthly = _fetch_t2m_monthly_cached(lat, lon, FULL_START, FULL_END, slug)
+            fig_t2m = go.Figure()
+            fig_t2m.add_trace(go.Scatter(
+                x=t2m_monthly["time"].values, y=t2m_monthly["tmax"].values,
+                mode="lines", name="Tmax", line=dict(color="#d62728", width=1),
+            ))
+            fig_t2m.add_trace(go.Scatter(
+                x=t2m_monthly["time"].values, y=t2m_monthly["tavg"].values,
+                mode="lines", name="Tavg", line=dict(color="#555555", width=1.5),
+            ))
+            fig_t2m.add_trace(go.Scatter(
+                x=t2m_monthly["time"].values, y=t2m_monthly["tmin"].values,
+                mode="lines", name="Tmin", line=dict(color="#1f77b4", width=1),
+            ))
+
+            # Tavg trend line (linear fit)
+            _t_ord = np.arange(t2m_monthly.sizes["time"])
+            _slope, _intercept = np.polyfit(_t_ord, t2m_monthly["tavg"].values, 1)
+            _trend = _slope * _t_ord + _intercept
+            _slope_per_decade = _slope * 12 * 10
+            fig_t2m.add_trace(go.Scatter(
+                x=t2m_monthly["time"].values, y=_trend,
+                mode="lines", name=f"Tavg trend ({_slope_per_decade:+.2f}°C/decade)",
+                line=dict(color="#000000", width=1.5, dash="dash"),
+            ))
+
+            fig_t2m.update_layout(
+                title=f"Monthly 2m air temperature — Tmin / Tavg / Tmax ({FULL_START}–{FULL_END})",
+                yaxis_title="T2m (°C)",
+                height=280,
+                margin=dict(t=36, b=16, l=40, r=16),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_t2m, use_container_width=True)
+            with st.expander("About this chart"):
+                st.markdown(
+                    "Monthly mean of daily maximum / mean / minimum 2m air temperature "
+                    "(ERA5 reanalysis, via Open-Meteo). This is a plain temperature "
+                    "sense check — a different metric from UTCI (below), included as a "
+                    "benchmark for how the raw temperature record is trending over the period. "
+                    "The dashed trend line is a linear fit to monthly Tavg over the full record."
+                )
+
+            # ── Year-vs-baseline anomaly ─────────────────────────────────────
+            _baseline_clim = (
+                t2m_monthly["tmax"]
+                .sel(time=slice(f"{BASELINE_START}-01-01", f"{BASELINE_END}-12-31"))
+                .groupby("time.month")
+                .mean()
+            )
+            _monthly_anomaly = t2m_monthly["tmax"].groupby("time.month") - _baseline_clim
+            _annual_anomaly  = _monthly_anomaly.groupby("time.year").mean()
+            _annual_anom_min = _monthly_anomaly.groupby("time.year").min()
+            _annual_anom_max = _monthly_anomaly.groupby("time.year").max()
+
+            _anomaly = _annual_anomaly.values
+            _anom_colors = ["#d62728" if v >= 0 else "#1f77b4" for v in _anomaly]
+            _err_plus  = _annual_anom_max.values - _anomaly
+            _err_minus = _anomaly - _annual_anom_min.values
+
+            fig_anom = go.Figure(go.Bar(
+                x=_annual_anomaly["year"].values,
+                y=_anomaly,
+                marker_color=_anom_colors,
+                error_y=dict(
+                    type="data",
+                    symmetric=False,
+                    array=_err_plus,
+                    arrayminus=_err_minus,
+                    color="#444",
+                    thickness=1,
+                    width=3,
+                ),
+            ))
+            fig_anom.add_hline(y=0, line_color="#888", line_width=1)
+
+            _anom_years = _annual_anomaly["year"].values
+            _a_ord = np.arange(len(_anom_years))
+            _a_slope, _a_intercept = np.polyfit(_a_ord, _anomaly, 1)
+            _a_trend = _a_slope * _a_ord + _a_intercept
+            fig_anom.add_trace(go.Scatter(
+                x=_anom_years, y=_a_trend,
+                mode="lines", name=f"Trend ({_a_slope * 10:+.2f}°C/decade)",
+                line=dict(color="#000000", width=1.5, dash="dash"),
+            ))
+
+            fig_anom.update_layout(
+                title=f"Annual Tmax anomaly vs. {BASELINE_START}–{BASELINE_END} baseline",
+                yaxis_title="Anomaly (°C)",
+                height=280,
+                margin=dict(t=36, b=16, l=40, r=16),
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_anom, use_container_width=True)
+            with st.expander("About this chart"):
+                st.markdown(
+                    f"Each bar is that year's mean monthly anomaly — each calendar month's "
+                    f"Tmax minus the {BASELINE_START}–{BASELINE_END} climatological mean for "
+                    "that same month, averaged across the year. Red = warmer than baseline, "
+                    "blue = cooler. The whiskers show the range from the coolest to the "
+                    "warmest monthly anomaly within that year, so a hot summer or mild winter "
+                    "that gets smoothed out of the annual mean is still visible. The dashed "
+                    "line is a linear trend fit to the annual anomalies. The final "
+                    "year in the record may be partial if data is not yet complete through "
+                    "December."
+                )
+        except Exception as exc:
+            st.warning(f"Could not load T2m sense-check data: {exc}")
 
         # Population trend (2000–2025)
         pop_years = [yr for yr in [2000, 2005, 2010, 2015, 2020, 2025] if city.get(f"pop_{yr}")]
@@ -826,6 +955,12 @@ with tab2:
         else:
             period_slug = f"{date_start}_{date_end}"
             job_id      = st.session_state.get("job_id")
+            _run_id_file = morph_dir / period_slug / "run_job_id.txt"
+            if not job_id and _run_id_file.exists():
+                _candidate = _run_id_file.read_text().strip()
+                if get_status(_candidate).get("status") in ("pending", "running"):
+                    job_id = _candidate
+                    st.session_state["job_id"] = job_id
 
             # ── Morphology download ───────────────────────────────────────────
             with st.expander("Download input data", expanded=True):
@@ -969,7 +1104,7 @@ with tab2:
                         st.caption("TARGET output NetCDF" + (" and ERA5 forcing CSV" if "era5_met_forcing.csv" in result_files else "") + ".")
                         st.download_button(
                             "Download TARGET results (.zip)",
-                            data=_zip_files(result_files),
+                            data=_zip_files(tuple(result_files.items())),
                             file_name=f"{city_id}_{period_slug}_results.zip",
                             mime="application/zip",
                             key="dl_results",

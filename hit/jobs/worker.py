@@ -16,9 +16,12 @@ def _write_status(job_dir: Path, status: dict) -> None:
 
 
 def run(job_id: str) -> None:
+    import pandas as pd
+
     from hit.config.city import CityConfig
     from hit.era5.forcing import fetch_era5_forcing
     from hit.jobs.queue import JOBS_DIR
+    from hit.target.parallel import PARALLEL_CELL_THRESHOLD, run_target_parallel
     from hit.target.results import load_results
     from hit.target.run import prepare_inputs, run_target
 
@@ -71,7 +74,17 @@ def run(job_id: str) -> None:
 
         status["step"] = "run"
         _write_status(job_dir, status)
-        output_npy = run_target(config_ini, progress=False)
+
+        n_cells = len(pd.read_csv(data_dir / "target_landcover.csv"))
+        if n_cells > PARALLEL_CELL_THRESHOLD:
+            output_npy = run_target_parallel(
+                config=config,
+                data_dir=data_dir,
+                run_dir=job_dir,
+                target_work_dir=target_work_dir,
+            )
+        else:
+            output_npy = run_target(config_ini, progress=False)
 
         status["step"] = "save"
         _write_status(job_dir, status)

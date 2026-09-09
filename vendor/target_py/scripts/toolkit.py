@@ -478,6 +478,13 @@ class Target:
                     timestepsTacValues.append(float(ta_rslts['Tac']))
 
             previousTacValues.append(timestepsTacValues)
+
+            # Write a checkpoint every 24 timesteps so progress survives a crash
+            if i > 0 and i % 24 == 0:
+                if not os.path.exists(self.OUT_DIR):
+                    os.makedirs(self.OUT_DIR)
+                np.save(os.path.join(self.OUT_DIR, self.run + "_checkpoint"), mod_rslts[:i + 1])
+
         ##########################################################################################
         self.mod_rslts = mod_rslts[1:len(met_data_all)]  ### THIS IS THE FINAL DATA ARRAY WITH MODEL OUTPUTS  ######
         ##########################################################################################
