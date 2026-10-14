@@ -65,7 +65,10 @@ HEAT_TYPE_LABELS = {
 MAP_OPTIONS = {
     "Peak UTCI (°C)":         "peak_utci",
     "Peak Radiant Temp Tmrt (°C)": "peak_tmrt",
+    "Peak air temp Ta (°C)":  "peak_ta",
+    "Nocturnal min air temp Ta (°C)": "min_ta_night",
     "Mean UHI (°C)":          "mean_uhi",
+    "Mean nocturnal UHI (°C)": "mean_night_uhi",
 }
 
 st.set_page_config(
@@ -169,7 +172,7 @@ def _grid_size_warning(n_cells: int) -> tuple[str, str] | None:
 
 _PREP_STEPS = [
     ("grid",       "Generate 200 m grid"),
-    ("buildings",  "Fetch building data (GBA WFS)"),
+    ("buildings",  "Fetch building data (GBA LoD1)"),
     ("roads",      "Fetch road data (Overture Maps)"),
     ("worldcover", "Fetch land cover (ESA WorldCover)"),
     ("combine",    "Combine land cover fractions"),
@@ -281,6 +284,26 @@ def _run_poll_fragment(job_id: str, date_start: str, date_end: str) -> None:
 # ── Layout ───────────────────────────────────────────────────────────────────
 
 st.title("HIT — Urban Heat Index Tool")
+def _restore_analysis_from_url() -> None:
+    qp = st.query_params
+    if "analysis" in st.session_state or not all(k in qp for k in ("country", "city", "start", "end")):
+        return
+    try:
+        matches = search_cities(qp["city"], country=qp["country"], n=50, db=_load_ucdb())
+    except Exception:
+        return
+    exact = [r for r in matches if r["name"] == qp["city"] and r["country"] == qp["country"]]
+    if not exact:
+        return
+    st.session_state["analysis"] = {
+        "city": exact[0],
+        "period": {"date_start": qp["start"], "date_end": qp["end"],
+                   "rank": "completed", "mean_utci": None, "anomaly": None},
+    }
+
+
+_restore_analysis_from_url()
+
 tab1, tab2, tab3 = st.tabs(["City Screening", "Neighbourhood Analysis", "Future Climate"])
 
 # ── Tab 1 ────────────────────────────────────────────────────────────────────
@@ -338,7 +361,7 @@ with tab1:
         if geom is not None:
             try:
                 lon_min, lat_min, lon_max, lat_max = geom.bounds
-                m_city = folium.Map(tiles="CartoDB positron")
+                m_city = folium.Map(tiles="OpenStreetMap")
                 folium.GeoJson(
                     geom.__geo_interface__,
                     style_function=lambda _: {
@@ -696,6 +719,14 @@ with tab2:
 
     analysis = st.session_state.get("analysis")
 
+    if analysis:
+        st.query_params.update({
+            "country": analysis["city"]["country"],
+            "city":    analysis["city"]["name"],
+            "start":   analysis["period"]["date_start"],
+            "end":     analysis["period"]["date_end"],
+        })
+
     if not analysis:
         st.info(
             "Select a city in the City Screening tab, then click "
@@ -719,6 +750,7 @@ with tab2:
         with hcol2:
             if st.button("Change", key="clear_analysis"):
                 del st.session_state["analysis"]
+                st.query_params.clear()
                 st.session_state.pop("job_id", None)
                 st.rerun()
 
@@ -728,10 +760,11 @@ with tab2:
         lc_path   = morph_dir / "target_landcover.csv"
 
         _prep_id_file = morph_dir / "prep_job_id.txt"
-        prep_job_id   = st.session_state.get("prep_job_id")
+        _prep_key     = f"prep_job_id:{city_id}"
+        prep_job_id   = st.session_state.get(_prep_key)
         if not prep_job_id and _prep_id_file.exists():
             prep_job_id = _prep_id_file.read_text().strip()
-            st.session_state["prep_job_id"] = prep_job_id
+            st.session_state[_prep_key] = prep_job_id
         prep_job_st   = get_status(prep_job_id).get("status") if prep_job_id else None
 
         if not lc_path.exists() and prep_job_st not in ("pending", "running", "complete"):
@@ -757,7 +790,7 @@ with tab2:
                 )
                 morph_dir.mkdir(parents=True, exist_ok=True)
                 _prep_id_file.write_text(new_prep_id)
-                st.session_state["prep_job_id"] = new_prep_id
+                st.session_state[_prep_key] = new_prep_id
                 st.rerun()
 
         elif prep_job_st in ("pending", "running"):
@@ -769,13 +802,7 @@ with tab2:
             _step_stats = prep_info.get("step_statuses") or {}
             _failed     = [label for key, label in _PREP_STEPS if _step_stats.get(key) == "failed"]
 
-            if "GBA WFS" in _prep_err:
-                st.error(
-                    "**Building data unavailable** — the GBA server is temporarily down. "
-                    "This is a third-party academic server with intermittent availability. "
-                    "Please try again in a few minutes."
-                )
-            elif _failed:
+            if _failed:
                 st.error(
                     f"Preparation failed at: **{', '.join(_failed)}**  \n"
                     f"{_prep_err}  \n\n"
@@ -791,7 +818,7 @@ with tab2:
                 step_statuses=_step_stats or None,
             )
             if st.button("Retry preparation", key="retry_prep"):
-                st.session_state.pop("prep_job_id", None)
+                st.session_state.pop(_prep_key, None)
                 st.rerun()
 
         if not lc_path.exists():
@@ -837,6 +864,16 @@ with tab2:
                 if _slug not in all_prestaged:
                     all_prestaged[_slug] = _nc
 
+            def _start_run() -> None:
+                cc = city_config_from_ucdb(t2_city, date_start, date_end, period_slug)
+                st.session_state["job_id"] = submit_run(
+                    city_config_dict=dataclasses.asdict(cc),
+                    data_dir=str(morph_dir),
+                    date_start=date_start,
+                    date_end=date_end,
+                )
+                st.rerun()
+
             ds            = None
             result_source = ""
             show_run_btn  = False
@@ -848,7 +885,9 @@ with tab2:
                 import shutil
                 output_path = get_status(job_id)["output_path"]
                 dest = morph_dir / period_slug / "target_results.nc"
-                if not dest.exists() and Path(output_path).exists():
+                if Path(output_path).exists() and (
+                    not dest.exists() or Path(output_path).stat().st_mtime > dest.stat().st_mtime
+                ):
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(output_path, dest)
                     all_prestaged[period_slug] = dest
@@ -900,19 +939,18 @@ with tab2:
                 if size_warn:
                     st.warning(size_warn[1])
                 if st.button("Run Neighbourhood Analysis", type="primary", key="run_job"):
-                    cc = city_config_from_ucdb(t2_city, date_start, date_end, period_slug)
-                    new_job_id = submit_run(
-                        city_config_dict=dataclasses.asdict(cc),
-                        data_dir=str(morph_dir),
-                        date_start=date_start,
-                        date_end=date_end,
-                    )
-                    st.session_state["job_id"] = new_job_id
-                    st.rerun()
+                    _start_run()
 
             # ── Results display ───────────────────────────────────────────────
             if ds is not None:
                 st.caption(result_source)
+                if job_st not in ("pending", "running") and period_slug in all_prestaged:
+                    if st.button(
+                        "Re-run TARGET for this period",
+                        key="rerun_job",
+                        help="Starts a new run (~25-30 min). Existing results stay visible until it finishes, then are replaced.",
+                    ):
+                        _start_run()
 
                 # ── Results download ──────────────────────────────────────────
                 result_files: dict[str, Path] = {}
@@ -940,7 +978,7 @@ with tab2:
                 # Summary metrics
                 peak_utci_val = float(ds["UTCI"].max())
                 peak_tmrt_val = float(ds["Tmrt"].max())
-                uhi_vals      = (ds["Ta"] - ds["Tb_rur"]).mean(dim="cell")
+                uhi_vals      = (ds["Ta"] - ds["Tb_rur"]).where(ds["Ta"] > -900).mean(dim="cell")
 
                 # Local-time mask for daytime (07:00–20:00)
                 local_hours = (
@@ -976,7 +1014,7 @@ with tab2:
                 )
 
                 with st.spinner("Building map…"):
-                    gdf = results_to_geodataframe(ds, grid_path)
+                    gdf = results_to_geodataframe(ds, grid_path, utc_offset=float(t2_utc))
                     valid = gdf[map_col].dropna()
                     vmin  = float(valid.quantile(0.02))
                     vmax  = float(valid.quantile(0.98))
@@ -995,7 +1033,7 @@ with tab2:
                     m = folium.Map(
                         location=[t2_lat, t2_lon],
                         zoom_start=13,
-                        tiles="CartoDB positron",
+                        tiles="OpenStreetMap",
                     )
                     folium.GeoJson(
                         gdf,
@@ -1028,8 +1066,13 @@ variable across the analysis period.
 - **Peak Tmrt** — maximum mean radiant temperature; captures the radiation load on a
   standing person from sun, sky, and surrounding surfaces; high spatial variability
   driven by building shade and sky-view factor
+- **Peak Ta** — maximum modelled canyon air temperature across the period
+- **Nocturnal min Ta** — lowest air temperature between 20:00 and 06:00 local time;
+  warm nights limit physiological recovery, so this is the most relevant air-temperature
+  layer for heat risk
 - **Mean UHI** — mean urban–rural air temperature difference (Ta urban − Tb rural)
   across the period; positive = urban is warmer than surrounding rural area
+- **Mean nocturnal UHI** — the same difference averaged over 20:00–06:00 local only
 
 **Model:** TARGET (Temperature of Air for Green/non-green urban Typologies)
 Broadbent et al. 2019, *Urban Climate* — [doi.org/10.1016/j.uclim.2018.11.002](https://doi.org/10.1016/j.uclim.2018.11.002)

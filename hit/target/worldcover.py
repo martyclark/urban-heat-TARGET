@@ -56,14 +56,20 @@ def fetch_worldcover(
 
     lat_starts = range(math.floor(lat_min / 3) * 3, math.ceil(lat_max / 3) * 3, 3)
     lon_starts = range(math.floor(lon_min / 3) * 3, math.ceil(lon_max / 3) * 3, 3)
-    tiles = [_tile_id(lat, lon) for lat in lat_starts for lon in lon_starts]
+    tiles = [(_tile_id(lat, lon), lat, lon) for lat in lat_starts for lon in lon_starts]
 
     tile_paths: list[Path] = []
-    for tile in tiles:
+    for tile, lat_sw, lon_sw in tiles:
         url = _WC_URL_TEMPLATE.format(tile=tile)
         vsicurl = f"/vsicurl/{url}"
         with rasterio.open(vsicurl) as src:
-            win = window_from_bounds(lon_min, lat_min, lon_max, lat_max, src.transform)
+            # Clip to this tile: a window running past the tile edge is clipped on read
+            # but window_transform keeps the unclipped origin, misplacing the data.
+            win = window_from_bounds(
+                max(lon_min, lon_sw), max(lat_min, lat_sw),
+                min(lon_max, lon_sw + 3), min(lat_max, lat_sw + 3),
+                src.transform,
+            )
             data = src.read(1, window=win)
             transform = src.window_transform(win)
             meta = src.meta.copy()

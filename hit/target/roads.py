@@ -8,6 +8,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import requests
 import shapely as _shapely
 from shapely import wkt as shapely_wkt
 from shapely.geometry import LineString
@@ -16,7 +17,8 @@ from shapely.strtree import STRtree
 
 _N_WORKERS = max(1, (os.cpu_count() or 4) - 1)
 
-_OVERTURE_RELEASE = "2026-05-20.0"
+_OVERTURE_RELEASE_FALLBACK = "2026-09-23.1"
+_OVERTURE_CATALOG_URL = "https://stac.overturemaps.org/catalog.json"
 
 _ROAD_WIDTHS: dict[str, float] = {
     "motorway": 12.0,
@@ -37,10 +39,18 @@ _TRANSECT_LENGTH_M = 80
 _MIN_W_M = 3.0
 
 
+def _latest_overture_release() -> str:
+    # Overture deletes old releases from S3 within weeks, so a pinned version rots.
+    try:
+        return requests.get(_OVERTURE_CATALOG_URL, timeout=10).json()["latest"]
+    except Exception:
+        return _OVERTURE_RELEASE_FALLBACK
+
+
 def fetch_overture_roads(
     bbox: tuple[float, float, float, float],
     cache_path: Path,
-    overture_release: str = _OVERTURE_RELEASE,
+    overture_release: str | None = None,
 ) -> gpd.GeoDataFrame:
     """Fetch road segments from Overture Maps S3 via DuckDB. Returns GeoDataFrame in WGS84."""
     if cache_path.exists():
@@ -51,6 +61,7 @@ def fetch_overture_roads(
     except ImportError as exc:
         raise ImportError("duckdb is required for road data: pip install duckdb") from exc
 
+    overture_release = overture_release or _latest_overture_release()
     xmin, ymin, xmax, ymax = bbox
     query = f"""
     SELECT id, class, ST_AsText(geometry) AS wkt, width_rules

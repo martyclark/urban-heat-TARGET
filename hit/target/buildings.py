@@ -1,22 +1,13 @@
 from __future__ import annotations
 
-import math
-import time
+import re
 from pathlib import Path
 
-import fiona
-import fiona.crs
 import geopandas as gpd
 import pandas as pd
-import requests
-from shapely.geometry import shape
 
-_GBA_WFS_URL = "https://tubvsig-so2sat-vm1.srv.mwn.de/geoserver/ows"
-_GBA_LAYER = "global3D:lod1_global"
-_GBA_PAGE_SIZE = 50000
-_GBA_TILE_DEG = 0.10   # ~11 km; keeps per-tile WFS responses fast
-_GBA_HITS_TIMEOUT = 60  # seconds — used only for the full-bbox preflight
-_GBA_PAGE_TIMEOUT = 120  # seconds — per page within a tile
+_GBA_BASE = "s3://us-west-2.opendata.source.coop/tge-labs/globalbuildingatlas-lod1/"
+_TILE_RE = re.compile(r"([ew])(\d{3})_([ns])(\d{2})_([ew])(\d{3})_([ns])(\d{2})\.parquet$")
 
 
 def _gba_empty() -> gpd.GeoDataFrame:
@@ -25,91 +16,24 @@ def _gba_empty() -> gpd.GeoDataFrame:
     )
 
 
-def _tile_bboxes(
-    lon_min: float, lat_min: float, lon_max: float, lat_max: float, tile_deg: float
-) -> list[tuple[float, float, float, float]]:
-    tiles = []
-    lon = lon_min
-    while lon < lon_max:
-        lat = lat_min
-        while lat < lat_max:
-            tiles.append((
-                round(lon, 6), round(lat, 6),
-                round(min(lon + tile_deg, lon_max), 6),
-                round(min(lat + tile_deg, lat_max), 6),
-            ))
-            lat = round(lat + tile_deg, 10)
-        lon = round(lon + tile_deg, 10)
-    return tiles
+def _signed(hemi: str, value: str) -> float:
+    return float(value) * (-1 if hemi in "ws" else 1)
 
 
-def _check_gba_hits(session: requests.Session, bbox_str: str, timeout: int) -> int | None:
-    """Return feature count for bbox, or None if server doesn't respond in time."""
-    params = {
-        "service": "WFS", "version": "2.0.0", "request": "GetFeature",
-        "typeNames": _GBA_LAYER, "bbox": bbox_str,
-        "outputFormat": "application/json", "resultType": "hits",
-    }
-    try:
-        resp = session.get(_GBA_WFS_URL, params=params, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        return int(data.get("numberMatched") or data.get("totalFeatures") or 0)
-    except Exception:
-        return None
-
-
-def _fetch_tile(
-    session: requests.Session,
-    bbox_str: str,
-    sink: "fiona.Collection",
-) -> int:
-    """Fetch all pages for one tile bbox, writing directly to sink. Returns feature count."""
-    start_index = 0
-    total: int | None = None
-    written = 0
-
-    while True:
-        params = {
-            "service": "WFS", "version": "2.0.0", "request": "GetFeature",
-            "typeNames": _GBA_LAYER, "bbox": bbox_str,
-            "outputFormat": "application/json",
-            "count": _GBA_PAGE_SIZE, "startIndex": start_index,
-            "sortBy": "height",
-        }
-        for attempt in range(3):
-            try:
-                resp = session.get(
-                    _GBA_WFS_URL, params=params, timeout=_GBA_PAGE_TIMEOUT,
-                    headers={"Accept-Encoding": "gzip, deflate"},
-                )
-                resp.raise_for_status()
-                break
-            except requests.RequestException as exc:
-                if attempt == 2:
-                    raise RuntimeError(f"GBA WFS tile {bbox_str} failed: {exc}") from exc
-                time.sleep(5 * (attempt + 1))
-
-        data = resp.json()
-        batch = data.get("features", [])
-        if total is None:
-            total = data.get("numberMatched") or data.get("totalFeatures") or 0
-
-        for f in batch:
-            geom = f.get("geometry")
-            if not geom:
-                continue
-            sink.write({
-                "geometry": geom,
-                "properties": {"height": f["properties"].get("height")},
-            })
-            written += 1
-
-        start_index += len(batch)
-        if not batch or (total and start_index >= total):
-            break
-
-    return written
+def _gba_tiles_for_bbox(con, bbox: tuple[float, float, float, float]) -> list[str]:
+    lon_min, lat_min, lon_max, lat_max = bbox
+    paths = [r[0] for r in con.execute(f"SELECT file FROM glob('{_GBA_BASE}*.parquet')").fetchall()]
+    hits = []
+    for path in paths:
+        m = _TILE_RE.search(path)
+        if not m:
+            continue
+        w, s_, e, n = (
+            _signed(m[1], m[2]), _signed(m[7], m[8]), _signed(m[5], m[6]), _signed(m[3], m[4]),
+        )
+        if w < lon_max and e > lon_min and s_ < lat_max and n > lat_min:
+            hits.append(path)
+    return hits
 
 
 def fetch_gba_buildings(
@@ -117,56 +41,53 @@ def fetch_gba_buildings(
     cache_path: Path,
     progress_cb: "Callable[[int, int], None] | None" = None,
 ) -> gpd.GeoDataFrame:
-    """Fetch GBA LoD1 buildings via WFS for bbox. Returns GeoDataFrame in WGS84.
+    """Fetch GBA LoD1 buildings for bbox from the Source Cooperative GeoParquet mirror.
 
-    Tiles the bbox into _GBA_TILE_DEG-degree cells so that each WFS request is
-    small enough to respond promptly regardless of city size. Results written
-    page-by-page to a temporary GeoPackage so memory stays bounded.
-    Cached to cache_path on success.
+    Returns GeoDataFrame in WGS84 with a `height` column. Cached to cache_path on success.
     """
     if cache_path.exists():
         return gpd.read_file(cache_path)
 
-    lon_min, lat_min, lon_max, lat_max = bbox
-    full_bbox_str = f"{lon_min},{lat_min},{lon_max},{lat_max},EPSG:4326"
-    session = requests.Session()
+    try:
+        import duckdb
+    except ImportError as exc:
+        raise ImportError("duckdb is required for building data: pip install duckdb") from exc
 
-    # Full-bbox hits check: fast-fail only on a definitive 0; timeout → proceed.
-    hits = _check_gba_hits(session, full_bbox_str, timeout=_GBA_HITS_TIMEOUT)
-    if hits == 0:
+    xmin, ymin, xmax, ymax = bbox
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; INSTALL httpfs;")
+    con.execute("LOAD spatial; LOAD httpfs;")
+    # Bucket name contains dots, which breaks virtual-host-style TLS.
+    con.execute("SET s3_region='us-west-2'; SET s3_url_style='path';")
+
+    tiles = _gba_tiles_for_bbox(con, bbox)
+    frames = []
+    for i, tile in enumerate(tiles):
+        df = con.execute(
+            f"""
+            SELECT height, ST_AsText(geometry) AS wkt
+            FROM read_parquet('{tile}')
+            WHERE bbox.xmin <= {xmax} AND bbox.xmax >= {xmin}
+              AND bbox.ymin <= {ymax} AND bbox.ymax >= {ymin}
+              AND height IS NOT NULL
+            """
+        ).fetchdf()
+        frames.append(df)
+        if progress_cb is not None:
+            progress_cb(i + 1, len(tiles))
+    con.close()
+
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if df.empty:
         return _gba_empty()
 
-    tiles = _tile_bboxes(lon_min, lat_min, lon_max, lat_max, _GBA_TILE_DEG)
-    n_tiles = len(tiles)
-
+    gdf = gpd.GeoDataFrame(
+        {"height": df["height"]},
+        geometry=gpd.GeoSeries.from_wkt(df["wkt"]),
+        crs="EPSG:4326",
+    )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = cache_path.with_suffix(".tmp.gpkg")
-    if tmp_path.exists():
-        tmp_path.unlink()
-
-    _schema = {
-        "geometry": "MultiPolygon",
-        "properties": {"height": "float"},
-    }
-    _crs = fiona.crs.from_epsg(3857)
-
-    total_written = 0
-
-    with fiona.open(tmp_path, "w", driver="GPKG", schema=_schema, crs=_crs) as sink:
-        for i, (tlon_min, tlat_min, tlon_max, tlat_max) in enumerate(tiles):
-            tile_bbox_str = f"{tlon_min},{tlat_min},{tlon_max},{tlat_max},EPSG:4326"
-            n = _fetch_tile(session, tile_bbox_str, sink)
-            total_written += n
-            if progress_cb is not None:
-                progress_cb(i + 1, n_tiles)
-
-    if total_written == 0:
-        tmp_path.unlink(missing_ok=True)
-        return _gba_empty()
-
-    gdf = gpd.read_file(tmp_path).to_crs("EPSG:4326")
     gdf.to_file(cache_path, driver="GPKG")
-    tmp_path.unlink(missing_ok=True)
     return gdf
 
 

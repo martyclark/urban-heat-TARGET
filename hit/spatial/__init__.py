@@ -8,33 +8,43 @@ import pandas as pd
 import xarray as xr
 
 
-def peak_conditions(ds: xr.Dataset) -> pd.DataFrame:
-    """Per-cell peak UTCI, peak Tmrt, and mean UHI for a TARGET results Dataset.
+def peak_conditions(ds: xr.Dataset, utc_offset: float = 0.0) -> pd.DataFrame:
+    """Per-cell summary statistics for a TARGET results Dataset.
 
     UHI = Ta (urban air, ERA5-forced) - Tb_rur (rural background).
-    Tmrt (mean radiant temperature) is used instead of Tac_can_roof, which is a
-    surface-stability hybrid and not a human-experienced air temperature.
-    Returns DataFrame with index 'cell' and columns: peak_utci, peak_tmrt, mean_uhi.
+    Night is 20:00-06:00 local, so utc_offset is needed for the nocturnal columns.
+    Returns DataFrame with index 'cell' and columns: peak_utci, peak_tmrt, peak_ta,
+    min_ta_night, mean_uhi, mean_night_uhi.
     """
+    ta        = ds["Ta"].where(ds["Ta"] > -900)
+    uhi       = ta - ds["Tb_rur"]
+    hours     = (pd.DatetimeIndex(ds["time"].values) + pd.Timedelta(hours=utc_offset)).hour
+    night     = np.flatnonzero((hours >= 20) | (hours < 6))
+
     peak_utci = ds["UTCI"].where(ds["UTCI"] > -900).max(dim="time").values
     peak_tmrt = ds["Tmrt"].where(ds["Tmrt"] > -900).max(dim="time").values
-    uhi       = (ds["Ta"] - ds["Tb_rur"]).where(ds["Ta"] > -900)
+    peak_ta   = ta.max(dim="time").values
+    min_ta_n  = ta.isel(time=night).min(dim="time").values
     mean_uhi  = uhi.mean(dim="time").values
+    mean_nuhi = uhi.isel(time=night).mean(dim="time").values
 
     return pd.DataFrame(
-        {"peak_utci": peak_utci, "peak_tmrt": peak_tmrt, "mean_uhi": mean_uhi},
+        {
+            "peak_utci": peak_utci, "peak_tmrt": peak_tmrt, "peak_ta": peak_ta,
+            "min_ta_night": min_ta_n, "mean_uhi": mean_uhi, "mean_night_uhi": mean_nuhi,
+        },
         index=pd.Index(ds["cell"].values, name="cell"),
     )
 
 
-def results_to_geodataframe(ds: xr.Dataset, grid_path: Path) -> gpd.GeoDataFrame:
+def results_to_geodataframe(ds: xr.Dataset, grid_path: Path, utc_offset: float = 0.0) -> gpd.GeoDataFrame:
     """Join per-cell peak stats from a TARGET Dataset to grid polygon geometry.
 
-    Returns a GeoDataFrame in EPSG:4326 with columns: peak_utci, peak_tmrt, mean_uhi.
+    Returns a GeoDataFrame in EPSG:4326 with the peak_conditions columns.
     Grid rows are 0-indexed and correspond positionally to the Dataset cell coordinate.
     """
     grid = gpd.read_file(grid_path)
-    peak_df = peak_conditions(ds).reset_index()
+    peak_df = peak_conditions(ds, utc_offset).reset_index()
     grid = grid.copy()
     grid["_cell"] = range(len(grid))
     gdf = grid.merge(peak_df, left_on="_cell", right_on="cell", how="left")
@@ -58,7 +68,7 @@ def diurnal_stats(ds: xr.Dataset, utc_offset: float = 0.0) -> pd.DataFrame:
     hours = times_local.hour
 
     tmrt = ds["Tmrt"].values                    # (time, cell)
-    ta   = ds["Ta"].mean(dim="cell").values      # (time,) ERA5 background air temp
+    ta   = ds["Ta"].where(ds["Ta"] > -900).mean(dim="cell").values      # (time,) ERA5 background air temp
 
     rows = []
     for h in range(24):
@@ -135,6 +145,6 @@ def uhi_series(ds: xr.Dataset, utc_offset: float = 0.0) -> pd.DataFrame:
     Returns DataFrame with columns: local_time, uhi.
     """
     times_local = pd.DatetimeIndex(ds["time"].values) + pd.Timedelta(hours=utc_offset)
-    ta  = ds["Ta"].mean(dim="cell").values
+    ta  = ds["Ta"].where(ds["Ta"] > -900).mean(dim="cell").values
     tb  = ds["Tb_rur"].mean(dim="cell").values
     return pd.DataFrame({"local_time": times_local, "uhi": ta - tb})
