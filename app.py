@@ -5,6 +5,7 @@ import dataclasses
 import json
 import io
 import math
+import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -131,6 +132,81 @@ def _fmt_pop(n: int | None) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.0f}k"
     return str(n)
+
+
+def _read_boundary_gdf(uploaded_file):
+    """Parse an uploaded boundary file to a WGS84 GeoDataFrame, unrepaired.
+
+    Accepts any vector format geopandas/GDAL can read (GeoJSON, GPKG, zipped
+    shapefile, ...) in whatever CRS the source file provides — reprojected here.
+    """
+    import geopandas as gpd
+
+    suffix = Path(uploaded_file.name).suffix.lower()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp) / uploaded_file.name
+        tmp_path.write_bytes(uploaded_file.getvalue())
+        gdf = gpd.read_file(f"zip://{tmp_path}" if suffix == ".zip" else tmp_path)
+
+    if gdf.empty:
+        raise ValueError("File contains no features.")
+    if gdf.crs is None:
+        raise ValueError("File has no CRS defined.")
+
+    return gdf.to_crs("EPSG:4326")
+
+
+def _invalid_feature_report(gdf, limit: int = 5) -> list[str]:
+    """List of human-readable topology errors for invalid features, capped at limit."""
+    from shapely.validation import explain_validity
+
+    invalid = gdf[~gdf.geometry.is_valid]
+    msgs = [f"feature {i}: {explain_validity(geom)}" for i, geom in invalid.geometry.items()]
+    if len(msgs) > limit:
+        msgs = msgs[:limit] + [f"...and {len(msgs) - limit} more"]
+    return msgs
+
+
+def _dissolve_boundary(gdf, repair: str | None = None, simplify_tol: float = 1e-4):
+    """Dissolve a boundary GeoDataFrame to a single WGS84 (Multi)Polygon.
+
+    repair=None: dissolve as-is — raises on invalid input.
+    repair="make_valid": repair topology errors (self-intersections etc.) before
+        dissolving. Preserves the input shape closely.
+    repair="simplify": make_valid, then simplify at simplify_tol degrees (~11 m
+        at the equator) as a fallback for inputs make_valid alone can't clean up.
+    """
+    import geopandas as gpd
+
+    gdf = gdf.copy()
+    if repair in ("make_valid", "simplify"):
+        invalid = ~gdf.geometry.is_valid
+        if invalid.any():
+            gdf.loc[invalid, gdf.geometry.name] = gdf.loc[invalid, gdf.geometry.name].make_valid()
+    if repair == "simplify":
+        gdf[gdf.geometry.name] = gdf.geometry.simplify(simplify_tol, preserve_topology=True).buffer(0)
+
+    geom = gdf.union_all()
+    if geom.geom_type == "GeometryCollection":
+        polys = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
+        if not polys:
+            raise ValueError("Boundary contains no polygon geometry after repair.")
+        geom = gpd.GeoSeries(polys, crs="EPSG:4326").union_all()
+    if geom.geom_type not in ("Polygon", "MultiPolygon") or not geom.is_valid:
+        raise ValueError(f"Could not produce a valid polygon (got {geom.geom_type}, valid={geom.is_valid}).")
+    return geom
+
+
+def _store_custom_boundary(cb_key: str, geom, label: str) -> None:
+    c = geom.centroid
+    st.session_state[cb_key] = {
+        "geometry":     geom,
+        "centroid_lat": c.y,
+        "centroid_lon": c.x,
+        "label":        label,
+    }
+
+
 
 
 def _zip_files(named_paths: dict[str, Path]) -> bytes:
@@ -871,6 +947,18 @@ with tab2:
         date_end   = t2_period["date_end"]
         city_id    = _city_id(t2_city)
 
+        cb_key = f"custom_boundary::{city_id}"
+        custom_boundary = st.session_state.get(cb_key)
+        prep_city = (
+            {
+                **t2_city,
+                "geometry":     custom_boundary["geometry"],
+                "centroid_lat": custom_boundary["centroid_lat"],
+                "centroid_lon": custom_boundary["centroid_lon"],
+            }
+            if custom_boundary else t2_city
+        )
+
         # Header row
         hcol1, hcol2 = st.columns([5, 1])
         with hcol1:
@@ -897,7 +985,92 @@ with tab2:
         prep_job_st   = get_status(prep_job_id).get("status") if prep_job_id else None
 
         if not lc_path.exists() and prep_job_st not in ("pending", "running", "complete"):
-            n_cells   = _estimate_grid_cells(t2_city)
+            with st.expander("Custom study area (optional)", expanded=bool(custom_boundary)):
+                if custom_boundary:
+                    st.success(f"Using custom boundary: {custom_boundary['label']}")
+                    if st.button("Clear custom boundary", key="clear_custom_boundary"):
+                        del st.session_state[cb_key]
+                        st.rerun()
+                else:
+                    st.caption(
+                        "Override the GHSL urban-centre boundary used for grid generation — "
+                        "upload a boundary file or enter a bounding box."
+                    )
+                    cb_mode = st.radio(
+                        "Boundary source", ["Upload file", "Bounding box"],
+                        key="cb_mode", horizontal=True,
+                    )
+                    if cb_mode == "Upload file":
+                        cb_upload = st.file_uploader(
+                            "Boundary file (GeoJSON, GPKG, or zipped shapefile)",
+                            type=["geojson", "json", "gpkg", "zip"],
+                            key="cb_upload",
+                        )
+                        if cb_upload is not None:
+                            try:
+                                cb_gdf = _read_boundary_gdf(cb_upload)
+                                cb_issues = _invalid_feature_report(cb_gdf)
+                            except Exception as exc:
+                                st.error(f"Could not read boundary: {exc}")
+                                cb_gdf, cb_issues = None, []
+
+                            if cb_gdf is not None and not cb_issues:
+                                if st.button("Apply boundary", key="cb_apply_upload"):
+                                    geom = _dissolve_boundary(cb_gdf, repair=None)
+                                    _store_custom_boundary(cb_key, geom, cb_upload.name)
+                                    st.rerun()
+
+                            elif cb_gdf is not None:
+                                simplify_flag = f"cb_offer_simplify::{cb_upload.name}_{cb_upload.size}"
+                                st.warning(
+                                    f"**{len(cb_issues)} of {len(cb_gdf)} feature(s) have topology errors** "
+                                    "and can't be used as-is:\n\n"
+                                    + "\n".join(f"- {msg}" for msg in cb_issues)
+                                )
+                                if st.button("Repair and continue", key="cb_repair"):
+                                    try:
+                                        geom = _dissolve_boundary(cb_gdf, repair="make_valid")
+                                        _store_custom_boundary(cb_key, geom, cb_upload.name)
+                                        st.session_state.pop(simplify_flag, None)
+                                        st.rerun()
+                                    except Exception as exc:
+                                        st.error(f"Repair could not produce a clean polygon: {exc}")
+                                        st.session_state[simplify_flag] = True
+
+                                if st.session_state.get(simplify_flag):
+                                    st.caption(
+                                        "The boundary is too distorted for a direct repair. "
+                                        "Simplifying will slightly smooth the outline to fix it."
+                                    )
+                                    if st.button("Run simplified topology fix", key="cb_simplify"):
+                                        try:
+                                            geom = _dissolve_boundary(cb_gdf, repair="simplify")
+                                            _store_custom_boundary(cb_key, geom, f"{cb_upload.name} (simplified)")
+                                            st.session_state.pop(simplify_flag, None)
+                                            st.rerun()
+                                        except Exception as exc:
+                                            st.error(f"Simplify also failed: {exc}")
+                    else:
+                        bcol1, bcol2, bcol3, bcol4 = st.columns(4)
+                        cb_lon_min = bcol1.number_input("Lon min", value=t2_lon - 0.05, format="%.4f", key="cb_lon_min")
+                        cb_lat_min = bcol2.number_input("Lat min", value=t2_lat - 0.05, format="%.4f", key="cb_lat_min")
+                        cb_lon_max = bcol3.number_input("Lon max", value=t2_lon + 0.05, format="%.4f", key="cb_lon_max")
+                        cb_lat_max = bcol4.number_input("Lat max", value=t2_lat + 0.05, format="%.4f", key="cb_lat_max")
+                        if st.button("Apply bounding box", key="cb_apply_bbox"):
+                            if cb_lon_min >= cb_lon_max or cb_lat_min >= cb_lat_max:
+                                st.error("Min values must be less than max values.")
+                            else:
+                                from shapely.geometry import box as _box
+                                geom = _box(cb_lon_min, cb_lat_min, cb_lon_max, cb_lat_max)
+                                st.session_state[cb_key] = {
+                                    "geometry":     geom,
+                                    "centroid_lat": (cb_lat_min + cb_lat_max) / 2,
+                                    "centroid_lon": (cb_lon_min + cb_lon_max) / 2,
+                                    "label":        f"bbox ({cb_lon_min:.3f}, {cb_lat_min:.3f}, {cb_lon_max:.3f}, {cb_lat_max:.3f})",
+                                }
+                                st.rerun()
+
+            n_cells   = _estimate_grid_cells(prep_city)
             size_warn = _grid_size_warning(n_cells)
             if size_warn:
                 st.warning(
@@ -911,9 +1084,9 @@ with tab2:
                 )
             if st.button("Prepare city data", type="primary", key="prep_btn"):
                 from hit.config.city import city_config_from_ucdb
-                cc = city_config_from_ucdb(t2_city, date_start, date_end, "prep")
+                cc = city_config_from_ucdb(prep_city, date_start, date_end, "prep")
                 new_prep_id = submit_prepare(
-                    city=t2_city,
+                    city=prep_city,
                     data_dir=str(morph_dir),
                     local_crs=cc.local_crs,
                 )
@@ -1000,7 +1173,7 @@ with tab2:
                     all_prestaged[_slug] = _nc
 
             def _start_run() -> None:
-                cc = city_config_from_ucdb(t2_city, date_start, date_end, period_slug)
+                cc = city_config_from_ucdb(prep_city, date_start, date_end, period_slug)
                 st.session_state["job_id"] = submit_run(
                     city_config_dict=dataclasses.asdict(cc),
                     data_dir=str(morph_dir),
@@ -1069,7 +1242,7 @@ with tab2:
                         )
 
             if show_run_btn:
-                n_cells   = _estimate_grid_cells(t2_city)
+                n_cells   = _estimate_grid_cells(prep_city)
                 size_warn = _grid_size_warning(n_cells)
                 if size_warn:
                     st.warning(size_warn[1])
